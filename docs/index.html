@@ -1,0 +1,37 @@
+﻿<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>三線跑酷遊戲</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <div class="game-container">
+
+    <canvas id="gameCanvas" width="480" height="700"></canvas>
+
+    <!-- 開始畫面 -->
+    <div id="screen-start">
+      <h1>三線跑酷遊戲</h1>
+      <button id="btn-start">開始遊戲</button>
+    </div>
+
+    <!-- 遊戲進行中 HUD -->
+    <div id="hud">
+      <span id="score-label">分數：</span><span id="score-value">0</span>
+    </div>
+
+    <!-- 遊戲結束畫面 -->
+    <div id="screen-gameover">
+      <h2>遊戲結束</h2>
+      <p id="final-score">最終分數：0</p>
+      <button id="btn-restart">重新開始</button>
+    </div>
+
+  </div>
+
+  <script src="game.js"></script>
+</body>
+</html>
