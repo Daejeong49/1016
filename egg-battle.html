@@ -1,0 +1,1097 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>丟蛋大戰｜Egg Battle</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: radial-gradient(circle at 50% 0%, #16233a 0%, #080d16 70%);
+    font-family: "Microsoft JhengHei", "Noto Sans TC", system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  #wrap { position: fixed; inset: 0; display: grid; place-items: center; }
+  canvas {
+    display: block;
+    width: min(100vw - 24px, calc((100vh - 24px) * 16 / 9), 1280px);
+    height: auto;
+    border-radius: 16px;
+    box-shadow: 0 30px 80px rgba(0,0,0,.65), 0 0 0 1px rgba(255,255,255,.06);
+    cursor: crosshair;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<script>
+(() => {
+  'use strict';
+
+  /* ================= 基本設定 ================= */
+  const W = 1280, H = 720;
+  const GRAV = 0.42;        // 重力
+  const K = 0.22;           // 力度 → 初速
+  const WINDMAX = 0.06;     // 最大風力（每 frame 的加速度）
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const DPR = Math.min(2, window.devicePixelRatio || 1);
+  canvas.width = W * DPR;
+  canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  // 蛋液圖層（永久留下）
+  const splatCv = document.createElement('canvas');
+  splatCv.width = W * DPR;
+  splatCv.height = H * DPR;
+  const sctx = splatCv.getContext('2d');
+  sctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  /* ================= 狀態 ================= */
+  let terrain = new Float32Array(W);
+  let players = [];
+  let turn = 0;
+  let state = 'aim';        // aim | fly | boom | over
+  let wind = 0;
+  let egg = null;
+  let particles = [];
+  let floats = [];
+  let shake = 0;
+  let boomTimer = 0;
+  let winner = null;
+  let time = 0;
+  let clouds = [];
+
+  const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+  const terrainAt = x => terrain[clamp(Math.round(x), 0, W - 1)];
+
+  /* ================= 地形 ================= */
+  function genTerrain() {
+    const a = Math.random() * 6.283, b = Math.random() * 6.283, c = Math.random() * 6.283;
+    const base = 600;
+    for (let x = 0; x < W; x++) {
+      terrain[x] = base
+        + Math.sin(x / 210 + a) * 44
+        + Math.sin(x / 83 + b) * 12
+        + Math.sin(x / 410 + c) * 36;
+    }
+    flatten(190, 90);
+    flatten(W - 190, 90);
+  }
+
+  function flatten(cx, w) {
+    const y = terrain[clamp(cx, 0, W - 1)];
+    for (let x = Math.max(0, cx - w); x < Math.min(W, cx + w); x++) {
+      const t = 1 - Math.abs(x - cx) / w;
+      const k = Math.pow(t, 0.7) * 0.9;
+      terrain[x] = terrain[x] * (1 - k) + y * k;
+    }
+  }
+
+  function terrainPath(c) {
+    c.beginPath();
+    c.moveTo(0, H);
+    c.lineTo(0, terrain[0]);
+    for (let x = 2; x < W; x += 2) c.lineTo(x, terrain[x]);
+    c.lineTo(W - 1, terrain[W - 1]);
+    c.lineTo(W, H);
+    c.closePath();
+  }
+
+  /* ================= 玩家 ================= */
+  function makePlayer(x, dir, body, comb, name) {
+    return {
+      x, dir, body, comb, name,
+      y: terrainAt(x), vy: 0,
+      hp: 100, angle: 45, power: 82
+    };
+  }
+
+  function newWind() {
+    let w = (Math.random() * 2 - 1) * WINDMAX;
+    if (Math.abs(w) < 0.016) w = (w < 0 ? -1 : 1) * (0.016 + Math.random() * 0.022);
+    return w;
+  }
+
+  function newRound() {
+    genTerrain();
+    sctx.clearRect(0, 0, W, H);
+    players = [
+      makePlayer(190, 1, '#fffaf0', '#e8452c', '玩家 1'),
+      makePlayer(W - 190, -1, '#d9a066', '#c0392b', '玩家 2')
+    ];
+    turn = 0;
+    state = 'aim';
+    wind = newWind();
+    egg = null;
+    particles = [];
+    floats = [];
+    shake = 0;
+    boomTimer = 0;
+    winner = null;
+
+    clouds = [];
+    for (let i = 0; i < 7; i++) {
+      clouds.push({
+        x: Math.random() * W,
+        y: 50 + Math.random() * 220,
+        s: 0.6 + Math.random() * 0.9,
+        sp: 0.05 + Math.random() * 0.12
+      });
+    }
+  }
+
+  /* ================= 動作 ================= */
+  function fire() {
+    if (state !== 'aim') return;
+    const p = players[turn];
+    const rad = p.angle * Math.PI / 180;
+    const v = K * p.power;
+    egg = {
+      x: p.x + p.dir * 20,
+      y: p.y - 84,
+      vx: p.dir * Math.cos(rad) * v,
+      vy: -Math.sin(rad) * v,
+      rot: 0,
+      trail: []
+    };
+    state = 'fly';
+    sfx('throw');
+  }
+
+  function updateEgg(dt) {
+    egg.vx += wind * dt;
+    egg.vy += GRAV * dt;
+    egg.x += egg.vx * dt;
+    egg.y += egg.vy * dt;
+    egg.rot += egg.vx * 0.035 * dt;
+
+    egg.trail.push({ x: egg.x, y: egg.y });
+    if (egg.trail.length > 16) egg.trail.shift();
+
+    // 打到對手
+    for (const p of players) {
+      if (Math.hypot(egg.x - p.x, egg.y - (p.y - 54)) < 36) {
+        explode(egg.x, egg.y, p);
+        return;
+      }
+    }
+    // 打到地面
+    const g = terrainAt(egg.x);
+    if (egg.y >= g) { explode(egg.x, g, null); return; }
+    // 飛出場外
+    if (egg.x < -150 || egg.x > W + 150 || egg.y > H + 400) endShot();
+  }
+
+  function endShot() {
+    egg = null;
+    state = 'boom';
+    boomTimer = 22;
+  }
+
+  function explode(x, y, target) {
+    egg = null;
+    state = 'boom';
+    boomTimer = 0;
+    shake = 16;
+
+    // 炸出凹洞
+    const R = 62;
+    for (let i = Math.max(0, Math.floor(x - R)); i < Math.min(W, Math.ceil(x + R)); i++) {
+      const dx = i - x;
+      const dy = Math.sqrt(Math.max(0, R * R - dx * dx));
+      terrain[i] = Math.max(terrain[i], y + dy * 0.98);
+    }
+
+    // 傷害
+    players.forEach(p => {
+      const d = Math.hypot(p.x - x, (p.y - 50) - y);
+      let dmg = 0;
+      if (p === target) dmg = 40;
+      else if (d < 118) dmg = 36 * (1 - d / 118) + 5;
+      if (dmg > 0.5) {
+        dmg = Math.round(dmg);
+        p.hp = Math.max(0, p.hp - dmg);
+        addFloat(p.x, p.y - 132, '-' + dmg, p === target ? '#ff4d4d' : '#ffa94d');
+      }
+    });
+
+    // 蛋液
+    drawSplat(x, y);
+
+    // 噴濺粒子
+    for (let i = 0; i < 46; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const sp = 2 + Math.random() * 9;
+      particles.push({
+        x, y,
+        vx: Math.cos(a) * sp,
+        vy: Math.sin(a) * sp - 3,
+        r: 2 + Math.random() * 5,
+        life: 26 + Math.random() * 30,
+        max: 56,
+        c: Math.random() < 0.62 ? '#fffdf0' : (Math.random() < 0.6 ? '#ffc61a' : '#ff9f1a')
+      });
+    }
+    sfx('splat');
+  }
+
+  function addFloat(x, y, text, color) {
+    floats.push({ x, y, text, color, life: 72, max: 72 });
+  }
+
+  function drawSplat(x, y) {
+    sctx.save();
+    sctx.translate(x, y);
+    // 蛋白
+    sctx.fillStyle = 'rgba(255,253,238,0.9)';
+    sctx.beginPath();
+    const n = 12;
+    for (let i = 0; i < n; i++) {
+      const a = i / n * Math.PI * 2;
+      const r = 24 + Math.random() * 26;
+      const px = Math.cos(a) * r;
+      const py = Math.sin(a) * r * 0.5;
+      if (i === 0) sctx.moveTo(px, py); else sctx.lineTo(px, py);
+    }
+    sctx.closePath();
+    sctx.fill();
+    // 蛋黃
+    sctx.fillStyle = 'rgba(255,190,40,0.95)';
+    sctx.beginPath();
+    sctx.ellipse(0, 0, 17, 11, 0, 0, Math.PI * 2);
+    sctx.fill();
+    sctx.fillStyle = 'rgba(255,222,96,0.95)';
+    sctx.beginPath();
+    sctx.ellipse(-4, -3, 9, 5.5, 0, 0, Math.PI * 2);
+    sctx.fill();
+    sctx.restore();
+  }
+
+  /* ================= 更新 ================= */
+  function settlePlayer(p, dt) {
+    const g = terrainAt(p.x);
+    if (p.y < g - 0.5) {
+      p.vy = Math.min(p.vy + GRAV * dt, 26);
+      p.y += p.vy * dt;
+      if (p.y > g) { p.y = g; p.vy = 0; }
+    } else if (p.y > g) {
+      p.y = g;
+      p.vy = 0;
+    }
+  }
+
+  function update(dt) {
+    time += dt;
+    for (const c of clouds) {
+      c.x += c.sp * dt;
+      if (c.x > W + 220) c.x = -220;
+    }
+    for (const p of players) settlePlayer(p, dt);
+
+    if (state === 'fly') updateEgg(dt);
+
+    if (state === 'boom') {
+      boomTimer += dt;
+      const falling = players.some(p => p.y < terrainAt(p.x) - 1.5);
+      if ((boomTimer > 52 && !falling) || boomTimer > 220) endBoom();
+    }
+
+    // 粒子
+    for (const p of particles) {
+      p.vy += 0.5 * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life -= dt;
+    }
+    particles = particles.filter(p => p.life > 0);
+
+    // 飄字
+    for (const f of floats) {
+      f.y -= 0.75 * dt;
+      f.life -= dt;
+    }
+    floats = floats.filter(f => f.life > 0);
+
+    if (shake > 0) shake = Math.max(0, shake - 0.9 * dt);
+  }
+
+  function endBoom() {
+    const dead = players.map((p, i) => p.hp <= 0 ? i : -1).filter(i => i >= 0);
+    if (dead.length >= 2) { winner = null; state = 'over'; return; }
+    if (dead.length === 1) { winner = 1 - dead[0]; state = 'over'; sfx('win'); return; }
+    turn = 1 - turn;
+    wind = newWind();
+    state = 'aim';
+    boomTimer = 0;
+  }
+
+  /* ================= 繪製：背景 ================= */
+  function drawSky() {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#5aa9dd');
+    g.addColorStop(0.42, '#a9d9ef');
+    g.addColorStop(0.72, '#e8f3e4');
+    g.addColorStop(1, '#fdf0cf');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // 太陽
+    const sx = 1080, sy = 130;
+    const sg = ctx.createRadialGradient(sx, sy, 10, sx, sy, 190);
+    sg.addColorStop(0, 'rgba(255,245,190,0.95)');
+    sg.addColorStop(0.25, 'rgba(255,232,150,0.45)');
+    sg.addColorStop(1, 'rgba(255,232,150,0)');
+    ctx.fillStyle = sg;
+    ctx.beginPath();
+    ctx.arc(sx, sy, 190, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,251,214,0.95)';
+    ctx.beginPath();
+    ctx.arc(sx, sy, 52, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawClouds() {
+    for (const c of clouds) {
+      ctx.save();
+      ctx.translate(c.x, c.y);
+      ctx.scale(c.s, c.s);
+      ctx.fillStyle = 'rgba(255,255,255,0.78)';
+      ctx.beginPath();
+      ctx.arc(0, 0, 34, 0, Math.PI * 2);
+      ctx.arc(38, 8, 26, 0, Math.PI * 2);
+      ctx.arc(-38, 10, 24, 0, Math.PI * 2);
+      ctx.arc(10, -16, 26, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function drawHills() {
+    const layers = [
+      { col: '#b7dcc7', base: 470, amp: 46, f: 0.0038, ph: 0.6 },
+      { col: '#96c9b1', base: 512, amp: 34, f: 0.0061, ph: 2.1 }
+    ];
+    for (const L of layers) {
+      ctx.beginPath();
+      ctx.moveTo(0, H);
+      for (let x = 0; x <= W; x += 8) {
+        const y = L.base + Math.sin(x * L.f + L.ph) * L.amp + Math.sin(x * L.f * 2.7 + L.ph) * 12;
+        ctx.lineTo(x, y);
+      }
+      ctx.lineTo(W, H);
+      ctx.closePath();
+      ctx.fillStyle = L.col;
+      ctx.fill();
+    }
+  }
+
+  /* ================= 繪製：地形 ================= */
+  function drawTerrain() {
+    ctx.save();
+    terrainPath(ctx);
+    const g = ctx.createLinearGradient(0, 520, 0, H);
+    g.addColorStop(0, '#9a7448');
+    g.addColorStop(0.35, '#7c5a35');
+    g.addColorStop(1, '#4a3520');
+    ctx.fillStyle = g;
+    ctx.fill();
+
+    // 土壤顆粒
+    ctx.clip();
+    ctx.fillStyle = 'rgba(0,0,0,0.07)';
+    for (let i = 0; i < 160; i++) {
+      const px = (i * 137.7) % W;
+      const py = 600 + ((i * 91.3) % 140);
+      ctx.beginPath();
+      ctx.arc(px, py, 1.5 + (i % 3), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // 草皮
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(0, terrain[0]);
+    for (let x = 2; x < W; x += 2) ctx.lineTo(x, terrain[x]);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.lineWidth = 15;
+    ctx.strokeStyle = '#4e9c2e';
+    ctx.stroke();
+    ctx.lineWidth = 8;
+    ctx.strokeStyle = '#7ecb45';
+    ctx.stroke();
+    ctx.restore();
+
+    // 草叢
+    ctx.save();
+    ctx.strokeStyle = 'rgba(110,196,62,0.85)';
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = 'round';
+    for (let x = 6; x < W; x += 17) {
+      const y = terrainAt(x);
+      const h = 5 + ((x * 7) % 9);
+      const sway = Math.sin(time * 0.03 + x * 0.05) * 2.5;
+      ctx.beginPath();
+      ctx.moveTo(x, y - 3);
+      ctx.quadraticCurveTo(x + sway, y - h * 0.6, x + sway * 1.6, y - h);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawSplatLayer() {
+    ctx.save();
+    terrainPath(ctx);
+    ctx.clip();
+    ctx.drawImage(splatCv, 0, 0, W, H);
+    ctx.restore();
+  }
+
+  /* ================= 繪製：雞 ================= */
+  function drawChicken(p) {
+    const dir = p.dir, x = p.x, y = p.y;
+
+    ctx.save();
+
+    // 影子
+    ctx.fillStyle = 'rgba(0,0,0,0.16)';
+    ctx.beginPath();
+    ctx.ellipse(x, y + 1, 36, 9, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 腿
+    ctx.strokeStyle = '#e8963a';
+    ctx.lineWidth = 5;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x - 10, y - 26); ctx.lineTo(x - 12, y - 3);
+    ctx.moveTo(x + 8, y - 26); ctx.lineTo(x + 10, y - 3);
+    ctx.stroke();
+    ctx.lineWidth = 3.5;
+    ctx.beginPath();
+    ctx.moveTo(x - 12, y - 3); ctx.lineTo(x - 20, y + 1);
+    ctx.moveTo(x - 12, y - 3); ctx.lineTo(x - 6, y + 2);
+    ctx.moveTo(x + 10, y - 3); ctx.lineTo(x + 2, y + 2);
+    ctx.moveTo(x + 10, y - 3); ctx.lineTo(x + 18, y + 1);
+    ctx.stroke();
+
+    // 尾巴
+    ctx.fillStyle = p.body;
+    ctx.beginPath();
+    ctx.moveTo(x - dir * 22, y - 62);
+    ctx.quadraticCurveTo(x - dir * 56, y - 78, x - dir * 48, y - 42);
+    ctx.quadraticCurveTo(x - dir * 40, y - 54, x - dir * 22, y - 46);
+    ctx.closePath();
+    ctx.fill();
+
+    // 身體
+    ctx.fillStyle = p.body;
+    ctx.strokeStyle = 'rgba(0,0,0,0.10)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.ellipse(x, y - 44, 31, 35, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // 翅膀
+    ctx.fillStyle = 'rgba(0,0,0,0.055)';
+    ctx.beginPath();
+    ctx.ellipse(x - dir * 5, y - 42, 16, 21, dir * 0.18, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 頭
+    const hx = x + dir * 10, hy = y - 84;
+    ctx.fillStyle = p.body;
+    ctx.beginPath();
+    ctx.arc(hx, hy, 22, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 雞冠
+    ctx.fillStyle = p.comb;
+    ctx.beginPath();
+    ctx.arc(hx - 8, hy - 20, 6, 0, Math.PI * 2);
+    ctx.arc(hx, hy - 25, 7, 0, Math.PI * 2);
+    ctx.arc(hx + 8, hy - 20, 5.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 喙
+    ctx.fillStyle = '#f5a623';
+    ctx.beginPath();
+    ctx.moveTo(hx + dir * 17, hy - 4);
+    ctx.lineTo(hx + dir * 34, hy + 3);
+    ctx.lineTo(hx + dir * 17, hy + 10);
+    ctx.closePath();
+    ctx.fill();
+
+    // 肉垂
+    ctx.fillStyle = p.comb;
+    ctx.beginPath();
+    ctx.ellipse(hx + dir * 15, hy + 15, 5, 8, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 眼睛
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(hx + dir * 7, hy - 4, 6.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#232323';
+    ctx.beginPath();
+    ctx.arc(hx + dir * 9, hy - 4, 3.6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.95)';
+    ctx.beginPath();
+    ctx.arc(hx + dir * 10.4, hy - 5.6, 1.3, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 受傷臉紅
+    if (p.hp < 40) {
+      ctx.fillStyle = 'rgba(230,80,80,0.35)';
+      ctx.beginPath();
+      ctx.ellipse(hx + dir * 12, hy + 6, 7, 4, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.restore();
+  }
+
+  /* ================= 繪製：蛋 / 瞄準 / 粒子 ================= */
+  function drawEgg() {
+    if (!egg) return;
+
+    // 軌跡
+    for (let i = 0; i < egg.trail.length; i++) {
+      const t = egg.trail[i];
+      const a = (i / egg.trail.length) * 0.35;
+      ctx.fillStyle = `rgba(255,255,255,${a})`;
+      ctx.beginPath();
+      ctx.arc(t.x, t.y, 2 + i * 0.16, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.save();
+    ctx.translate(egg.x, egg.y);
+    ctx.rotate(egg.rot);
+    ctx.fillStyle = 'rgba(0,0,0,0.12)';
+    ctx.beginPath();
+    ctx.ellipse(2, 3, 11, 15, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#fffdf5';
+    ctx.strokeStyle = 'rgba(0,0,0,0.16)';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 10.5, 14.5, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.beginPath();
+    ctx.ellipse(-3.5, -5, 3, 4.5, -0.4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawAim() {
+    if (state !== 'aim') return;
+    const p = players[turn];
+    const rad = p.angle * Math.PI / 180;
+    const v = K * p.power;
+
+    let vx = p.dir * Math.cos(rad) * v;
+    let vy = -Math.sin(rad) * v;
+    let x = p.x + p.dir * 20;
+    let y = p.y - 84;
+
+    // 預覽弧線（只顯示前段，保留手感）
+    for (let i = 0; i < 26; i++) {
+      vx += wind;
+      vy += GRAV;
+      x += vx;
+      y += vy;
+      if (i % 2) continue;
+      const a = 0.55 * (1 - i / 26);
+      ctx.fillStyle = `rgba(255,255,255,${a})`;
+      ctx.beginPath();
+      ctx.arc(x, y, 3.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // 瞄準箭頭
+    const ax = p.x + p.dir * 20;
+    const ay = p.y - 84;
+    const len = 40 + p.power * 0.55;
+    ctx.save();
+    ctx.translate(ax, ay);
+    ctx.rotate(-p.dir * rad);
+    ctx.strokeStyle = 'rgba(255,213,74,0.9)';
+    ctx.lineWidth = 4;
+    ctx.lineCap = 'round';
+    ctx.setLineDash([9, 8]);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(len, 0);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(255,213,74,0.95)';
+    ctx.beginPath();
+    ctx.moveTo(len + 12, 0);
+    ctx.lineTo(len - 4, -8);
+    ctx.lineTo(len - 4, 8);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawParticles() {
+    for (const p of particles) {
+      const a = clamp(p.life / p.max, 0, 1);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = p.c;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r * (0.5 + a * 0.5), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawFloats() {
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (const f of floats) {
+      const a = clamp(f.life / 26, 0, 1);
+      ctx.globalAlpha = a;
+      ctx.font = '800 30px "Microsoft JhengHei","Noto Sans TC",system-ui,sans-serif';
+      ctx.lineWidth = 5;
+      ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+      ctx.strokeText(f.text, f.x, f.y);
+      ctx.fillStyle = f.color;
+      ctx.fillText(f.text, f.x, f.y);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /* ================= HUD ================= */
+  function rr(c, x, y, w, h, r) {
+    c.beginPath();
+    c.moveTo(x + r, y);
+    c.arcTo(x + w, y, x + w, y + h, r);
+    c.arcTo(x + w, y + h, x, y + h, r);
+    c.arcTo(x, y + h, x, y, r);
+    c.arcTo(x, y, x + w, y, r);
+    c.closePath();
+  }
+
+  function drawHealthPanel(p, side) {
+    const w = 430, h = 86, pad = 22;
+    const x = side === 0 ? pad : W - pad - w;
+    const y = pad;
+    const active = (players[turn] === p && state !== 'over');
+
+    ctx.fillStyle = 'rgba(8,18,32,0.52)';
+    rr(ctx, x, y, w, h, 18);
+    ctx.fill();
+    ctx.lineWidth = active ? 3 : 1.5;
+    ctx.strokeStyle = active ? 'rgba(255,213,74,0.95)' : 'rgba(255,255,255,0.14)';
+    ctx.stroke();
+
+    const avX = side === 0 ? x + 54 : x + w - 54;
+    const avY = y + h / 2;
+
+    ctx.fillStyle = p.body;
+    ctx.beginPath();
+    ctx.arc(avX, avY, 27, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.22)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.fillStyle = p.comb;
+    ctx.beginPath();
+    ctx.arc(avX - 9, avY - 22, 5, 0, Math.PI * 2);
+    ctx.arc(avX, avY - 25, 6, 0, Math.PI * 2);
+    ctx.arc(avX + 9, avY - 22, 5, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = '#232323';
+    ctx.beginPath();
+    ctx.arc(avX - 7, avY - 3, 3, 0, Math.PI * 2);
+    ctx.arc(avX + 7, avY - 3, 3, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = '#f5a623';
+    ctx.beginPath();
+    ctx.moveTo(avX, avY + 3);
+    ctx.lineTo(avX + 10, avY + 9);
+    ctx.lineTo(avX - 10, avY + 9);
+    ctx.closePath();
+    ctx.fill();
+
+    const textX = side === 0 ? x + 96 : x + w - 96;
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = side === 0 ? 'left' : 'right';
+    ctx.fillStyle = '#eaf1fa';
+    ctx.font = '700 21px "Microsoft JhengHei","Noto Sans TC",system-ui,sans-serif';
+    ctx.fillText(p.name, textX, y + 34);
+
+    ctx.textAlign = side === 0 ? 'right' : 'left';
+    ctx.fillStyle = p.hp > 40 ? '#9fe8b5' : '#ff8a8a';
+    ctx.font = '800 22px "Microsoft JhengHei","Noto Sans TC",system-ui,sans-serif';
+    ctx.fillText(Math.ceil(p.hp), side === 0 ? x + w - 24 : x + 24, y + 34);
+
+    const bw = 310, bh = 17;
+    const bx = side === 0 ? textX : x + 22;
+    const by = y + 50;
+
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    rr(ctx, bx, by, bw, bh, 8.5);
+    ctx.fill();
+
+    const frac = clamp(p.hp / 100, 0, 1);
+    if (frac > 0) {
+      const g = ctx.createLinearGradient(bx, 0, bx + bw, 0);
+      g.addColorStop(0, '#3ddc84');
+      g.addColorStop(0.55, '#ffd93d');
+      g.addColorStop(1, '#ff5c5c');
+      ctx.save();
+      rr(ctx, bx, by, bw, bh, 8.5);
+      ctx.clip();
+      ctx.fillStyle = g;
+      ctx.fillRect(bx, by, bw * frac, bh);
+      ctx.restore();
+    }
+    ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+    ctx.lineWidth = 1.5;
+    rr(ctx, bx, by, bw, bh, 8.5);
+    ctx.stroke();
+  }
+
+  function drawWindPanel() {
+    const w = 200, h = 82;
+    const x = (W - w) / 2, y = 22;
+    ctx.fillStyle = 'rgba(8,18,32,0.5)';
+    rr(ctx, x, y, w, h, 16);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = '#93aecb';
+    ctx.font = '600 13px "Microsoft JhengHei","Noto Sans TC",system-ui,sans-serif';
+    ctx.fillText('風　向', W / 2, y + 22);
+
+    const lvl = Math.abs(wind) / WINDMAX;
+    const dir = wind >= 0 ? 1 : -1;
+    const len = 26 + lvl * 62;
+    const cy = y + 46;
+
+    ctx.strokeStyle = '#7dd3fc';
+    ctx.lineWidth = 5;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(W / 2 - dir * len / 2, cy);
+    ctx.lineTo(W / 2 + dir * len / 2, cy);
+    ctx.stroke();
+
+    ctx.fillStyle = '#7dd3fc';
+    ctx.beginPath();
+    ctx.moveTo(W / 2 + dir * (len / 2 + 10), cy);
+    ctx.lineTo(W / 2 + dir * (len / 2 - 2), cy - 8);
+    ctx.lineTo(W / 2 + dir * (len / 2 - 2), cy + 8);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = '#cfe8ff';
+    ctx.font = '700 13px "Microsoft JhengHei","Noto Sans TC",system-ui,sans-serif';
+    ctx.fillText((Math.abs(wind) * 100).toFixed(1), W / 2, y + 72);
+  }
+
+  function drawControlPanel() {
+    const p = players[turn];
+    const w = 560, h = 58;
+    const x = (W - w) / 2;
+    const y = H - 96;
+
+    ctx.fillStyle = 'rgba(8,18,32,0.55)';
+    rr(ctx, x, y, w, h, 18);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.textBaseline = 'middle';
+
+    // 角度
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#93aecb';
+    ctx.font = '600 15px "Microsoft JhengHei","Noto Sans TC",system-ui,sans-serif';
+    ctx.fillText('角度', x + 26, y + h / 2);
+    ctx.fillStyle = '#ffd54a';
+    ctx.font = '800 26px "Microsoft JhengHei","Noto Sans TC",system-ui,sans-serif';
+    ctx.fillText(String(p.angle) + '°', x + 68, y + h / 2 + 1);
+
+    // 力度
+    const bx = x + 178, by = y + h / 2 - 9, bw = 240, bh = 18;
+    ctx.fillStyle = '#93aecb';
+    ctx.font = '600 15px "Microsoft JhengHei","Noto Sans TC",system-ui,sans-serif';
+    ctx.fillText('力度', x + 140, y + h / 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    rr(ctx, bx, by, bw, bh, 9);
+    ctx.fill();
+
+    const frac = p.power / 100;
+    const g = ctx.createLinearGradient(bx, 0, bx + bw, 0);
+    g.addColorStop(0, '#4ade80');
+    g.addColorStop(0.6, '#facc15');
+    g.addColorStop(1, '#f87171');
+    ctx.save();
+    rr(ctx, bx, by, bw, bh, 9);
+    ctx.clip();
+    ctx.fillStyle = g;
+    ctx.fillRect(bx, by, bw * frac, bh);
+    ctx.restore();
+    ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+    ctx.lineWidth = 1.5;
+    rr(ctx, bx, by, bw, bh, 9);
+    ctx.stroke();
+
+    ctx.fillStyle = '#eaf1fa';
+    ctx.font = '800 20px "Microsoft JhengHei","Noto Sans TC",system-ui,sans-serif';
+    ctx.fillText(String(Math.round(p.power)), bx + bw + 14, y + h / 2 + 1);
+
+    // 提示
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(220,232,245,0.55)';
+    ctx.font = '600 13px "Microsoft JhengHei","Noto Sans TC",system-ui,sans-serif';
+    ctx.fillText('↑↓ 角度　←→ 力度　空白鍵發射　或滑鼠拖曳瞄準', W / 2, H - 20);
+  }
+
+  function drawTurnArrow() {
+    if (state !== 'aim') return;
+    const p = players[turn];
+    const bob = Math.sin(time * 0.09) * 6;
+    ctx.save();
+    ctx.fillStyle = '#ffd54a';
+    ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y - 148 + bob);
+    ctx.lineTo(p.x - 14, p.y - 170 + bob);
+    ctx.lineTo(p.x + 14, p.y - 170 + bob);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawOverlay() {
+    if (state !== 'over') return;
+    ctx.fillStyle = 'rgba(4,10,20,0.74)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+
+    // 蛋
+    const bob = Math.sin(time * 0.06) * 8;
+    ctx.save();
+    ctx.translate(W / 2, H / 2 - 170 + bob);
+    ctx.rotate(Math.sin(time * 0.04) * 0.15);
+    ctx.fillStyle = '#fffdf5';
+    ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 34, 46, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.fillStyle = '#ffd54a';
+    ctx.font = '800 62px "Microsoft JhengHei","Noto Sans TC",system-ui,sans-serif';
+    const title = winner === null ? '平手！' : players[winner].name + ' 獲勝！';
+    ctx.fillText(title, W / 2, H / 2 - 40);
+
+    ctx.fillStyle = '#dbe7f5';
+    ctx.font = '600 24px "Microsoft JhengHei","Noto Sans TC",system-ui,sans-serif';
+    ctx.fillText('點擊畫面或按 R 再來一局', W / 2, H / 2 + 30);
+
+    ctx.fillStyle = 'rgba(200,215,235,0.6)';
+    ctx.font = '600 18px "Microsoft JhengHei","Noto Sans TC",system-ui,sans-serif';
+    ctx.fillText('玩家 1：' + Math.ceil(players[0].hp) + ' HP　　' +
+                 '玩家 2：' + Math.ceil(players[1].hp) + ' HP', W / 2, H / 2 + 84);
+  }
+
+  /* ================= 音效 ================= */
+  let actx = null;
+  function sfx(type) {
+    try {
+      if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+      if (actx.state === 'suspended') actx.resume();
+      const t = actx.currentTime;
+      const o = actx.createOscillator();
+      const g = actx.createGain();
+      o.connect(g);
+      g.connect(actx.destination);
+
+      if (type === 'throw') {
+        o.type = 'triangle';
+        o.frequency.setValueAtTime(420, t);
+        o.frequency.exponentialRampToValueAtTime(180, t + 0.12);
+        g.gain.setValueAtTime(0.10, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.14);
+        o.start(t); o.stop(t + 0.15);
+      } else if (type === 'splat') {
+        o.type = 'sawtooth';
+        o.frequency.setValueAtTime(200, t);
+        o.frequency.exponentialRampToValueAtTime(55, t + 0.22);
+        g.gain.setValueAtTime(0.16, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
+        o.start(t); o.stop(t + 0.26);
+      } else if (type === 'win') {
+        o.type = 'sine';
+        o.frequency.setValueAtTime(523, t);
+        o.frequency.setValueAtTime(659, t + 0.13);
+        o.frequency.setValueAtTime(784, t + 0.26);
+        o.frequency.setValueAtTime(1047, t + 0.39);
+        g.gain.setValueAtTime(0.12, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.62);
+        o.start(t); o.stop(t + 0.63);
+      }
+    } catch (e) { /* 忽略音效錯誤 */ }
+  }
+
+  /* ================= 主繪製 ================= */
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+
+    ctx.save();
+    if (shake > 0.2) {
+      ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    }
+
+    drawSky();
+    drawClouds();
+    drawHills();
+    drawTerrain();
+    drawSplatLayer();
+
+    for (const p of players) drawChicken(p);
+    drawEgg();
+    drawAim();
+    drawParticles();
+    drawFloats();
+    drawTurnArrow();
+
+    ctx.restore();
+
+    // 暗角
+    const vg = ctx.createRadialGradient(W / 2, H / 2, H * 0.45, W / 2, H / 2, H * 0.95);
+    vg.addColorStop(0, 'rgba(0,0,0,0)');
+    vg.addColorStop(1, 'rgba(0,0,0,0.32)');
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, W, H);
+
+    drawHealthPanel(players[0], 0);
+    drawHealthPanel(players[1], 1);
+    drawWindPanel();
+    if (state !== 'over') drawControlPanel();
+    drawOverlay();
+  }
+
+  /* ================= 主迴圈 ================= */
+  let last = performance.now();
+  function loop(now) {
+    const dt = clamp((now - last) / 16.6667, 0, 2.6);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  /* ================= 輸入 ================= */
+  window.addEventListener('keydown', e => {
+    const keys = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'];
+    if (keys.includes(e.code)) e.preventDefault();
+
+    if (state === 'over') {
+      if (e.code === 'KeyR' || e.code === 'Space' || e.code === 'Enter') newRound();
+      return;
+    }
+    if (state !== 'aim') return;
+
+    const p = players[turn];
+    switch (e.code) {
+      case 'ArrowUp': case 'KeyW':
+        p.angle = clamp(p.angle + 1, 0, 89); break;
+      case 'ArrowDown': case 'KeyS':
+        p.angle = clamp(p.angle - 1, 0, 89); break;
+      case 'ArrowRight': case 'KeyD':
+        p.power = clamp(p.power + 1, 5, 100); break;
+      case 'ArrowLeft': case 'KeyA':
+        p.power = clamp(p.power - 1, 5, 100); break;
+      case 'Space': case 'Enter':
+        fire(); break;
+    }
+  }, { passive: false });
+
+  function pointerPos(e) {
+    const r = canvas.getBoundingClientRect();
+    return {
+      x: (e.clientX - r.left) / r.width * W,
+      y: (e.clientY - r.top) / r.height * H
+    };
+  }
+
+  let dragging = false;
+  let dragStart = null;
+  let dragDist = 0;
+
+  canvas.addEventListener('pointerdown', e => {
+    if (state === 'over') { newRound(); return; }
+    if (state !== 'aim') return;
+    dragging = true;
+    dragStart = pointerPos(e);
+    dragDist = 0;
+    updateAimFromPointer(e);
+    canvas.setPointerCapture(e.pointerId);
+  });
+
+  canvas.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const m = pointerPos(e);
+    dragDist = Math.hypot(m.x - dragStart.x, m.y - dragStart.y);
+    updateAimFromPointer(e);
+  });
+
+  canvas.addEventListener('pointerup', e => {
+    if (!dragging) return;
+    dragging = false;
+    if (dragDist > 26) fire();
+  });
+
+  canvas.addEventListener('pointercancel', () => { dragging = false; });
+
+  function updateAimFromPointer(e) {
+    const p = players[turn];
+    const m = pointerPos(e);
+    const mx = p.x, my = p.y - 84;
+    const dx = (m.x - mx) * p.dir;
+    const dy = -(m.y - my);
+    let ang = Math.atan2(dy, dx) * 180 / Math.PI;
+    p.angle = clamp(ang, 0, 89);
+    const dist = Math.hypot(m.x - mx, m.y - my);
+    p.power = clamp(dist / 4.2, 10, 100);
+  }
+
+  /* ================= 啟動 ================= */
+  newRound();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
